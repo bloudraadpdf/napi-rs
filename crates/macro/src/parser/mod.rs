@@ -253,8 +253,8 @@ fn replace_self(mut ty: syn::Type, self_ty: Option<&Ident>) -> syn::Type {
     Some(i) => i,
     None => return ty,
   };
-  let path = match get_ty(&mut ty) {
-    syn::Type::Path(syn::TypePath { qself: None, path }) => path.clone(),
+  let (path, attrs) = match get_ty(&mut ty) {
+    syn::Type::Path(syn::TypePath { qself: None, path, attrs }) => (path.clone(), attrs.clone()),
     other => return other.clone(),
   };
   let new_path = if path.segments.len() == 1 && path.segments[0].ident == "Self" {
@@ -263,6 +263,7 @@ fn replace_self(mut ty: syn::Type, self_ty: Option<&Ident>) -> syn::Type {
     path
   };
   syn::Type::Path(syn::TypePath {
+    attrs,
     qself: None,
     path: new_path,
   })
@@ -303,7 +304,7 @@ fn extract_callback_trait_types(
       bail_span!(arguments, "use parentheses for napi callback trait")
     }
     syn::PathArguments::Parenthesized(arguments) => {
-      let args = arguments.inputs.iter().cloned().collect::<Vec<_>>();
+      let args = arguments.inputs.iter().map(|arg| arg.ty.clone()).collect::<Vec<_>>();
 
       let ret = match &arguments.output {
         syn::ReturnType::Type(_, ret_ty) => {
@@ -333,7 +334,7 @@ fn extract_callback_trait_types(
 
 fn extract_result_ty(ty: &syn::Type) -> BindgenResult<Option<syn::Type>> {
   match ty {
-    syn::Type::Path(syn::TypePath { qself: None, path }) => {
+    syn::Type::Path(syn::TypePath { qself: None, path, .. }) => {
       let segment = path.segments.last().unwrap();
       if segment.ident != "Result" {
         Ok(None)
@@ -631,15 +632,14 @@ fn napi_fn_from_decl(
       syn::FnArg::Receiver(r) => {
         if parent.is_some() {
           assert!(fn_self.is_none());
-          if r.reference.is_none() {
-            errors.push(err_span!(
+          match &r.kind {
+            syn::ReceiverKind::Reference(_, _, mutability) => {
+              fn_self = Some(if mutability.is_some() { FnSelf::MutRef } else { FnSelf::Ref });
+            }
+            _ => errors.push(err_span!(
               r,
               "The native methods can't move values from napi. Try `&self` or `&mut self` instead."
-            ));
-          } else if r.mutability.is_some() {
-            fn_self = Some(FnSelf::MutRef);
-          } else {
-            fn_self = Some(FnSelf::Ref);
+            )),
           }
         } else {
           errors.push(err_span!(r, "arguments cannot be `self`"));
@@ -890,7 +890,7 @@ fn napi_fn_from_decl(
       enumerable: opts.enumerable(),
       configurable: opts.configurable(),
       catch_unwind: opts.catch_unwind().is_some(),
-      unsafe_: sig.unsafety.is_some(),
+      unsafe_: matches!(sig.safety, syn::Safety::Unsafe(_)),
       register_name: get_register_ident(ident.to_string().as_str()),
       no_export: opts.no_export().is_some(),
     })
@@ -1422,6 +1422,7 @@ impl ConvertToAST for syn::ItemImpl {
       syn::Type::Path(syn::TypePath {
         ref mut path,
         qself: None,
+        ..
       }) => path,
       _ => {
         bail_span!(self.self_ty, "unsupported self type in #[napi] impl")
@@ -1448,7 +1449,7 @@ impl ConvertToAST for syn::ItemImpl {
       if let Some(method) = match item {
         syn::ImplItem::Fn(m) => Some(m),
         syn::ImplItem::Type(m) => {
-          if let Some((_, t, _)) = &self.trait_ {
+          if let Some((t, _)) = &self.trait_ {
             if let Some(PathSegment { ident, .. }) = t.segments.last() {
               if (ident == "Task" || ident == "ScopedTask") && m.ident == "JsValue" {
                 task_output_type = Some(m.ty.clone());
